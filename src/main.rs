@@ -5,11 +5,16 @@
 //! development so you can exercise your Rust client's framing, parsing,
 //! and reconnect/timeout logic.
 //!
-//! Protocol, reverse-derived directly from elephantrobotics/pymycobot's
-//! `pymycobot/common.py` (ProtocolCode + DataProcessor._mesg /
-//! _process_received):
+//! Wire behaviour (one `recv()` == one message, like the real server):
 //!
-//!   Request/response frame shape (both directions are the same shape):
+//!   1. Handshake: the client sends three plain-text messages
+//!      (serial port, baud rate, timeout). The server replies b"1" to each.
+//!
+//!   2. Commands: the client sends each frame as the TEXT of a list, e.g.
+//!      "[254, 254, 2, 32, 250]". Raw FE FE ... bytes are also accepted.
+//!      The server replies with a raw binary frame.
+//!
+//! Frame shape (both directions):
 //!
 //!       FE FE  LEN  CMD  [DATA...]  FA
 //!       \__/   |    |    |          |
@@ -124,49 +129,38 @@ fn ack() -> Vec<u8> {
     vec![0x01]
 }
 
-/// Read exactly one frame off the stream: FE FE LEN CMD DATA... FA
-/// Returns (command, data) or None on clean disconnect.
-fn read_frame(stream: &mut TcpStream) -> std::io::Result<Option<(u8, Vec<u8>)>> {
-    // Byte-scan for the FE FE sync header, tolerating stray bytes in
-    // between (mirrors _is_frame_header scanning in pymycobot).
-    let mut prev: Option<u8> = None;
-    let mut one = [0u8; 1];
-    loop {
-        match stream.read(&mut one) {
-            Ok(0) => return Ok(None), // peer closed
-            Ok(_) => {}
-            Err(e) => return Err(e),
-        }
-        let b = one[0];
-        if prev == Some(HEADER) && b == HEADER {
-            break;
-        }
-        prev = Some(b);
+/// Parse one message into (command, data). Accepts either the text form
+/// "[254, 254, 2, 32, 250]" (what the client sends) or raw FE FE ... bytes.
+fn parse_message(buf: &[u8]) -> Option<(u8, Vec<u8>)> {
+    let bytes: Vec<u8> = if buf.starts_with(&[HEADER, HEADER]) {
+        buf.to_vec()
+    } else {
+        std::str::from_utf8(buf)
+            .ok()?
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+            .filter_map(|t| t.trim().parse::<u8>().ok())
+            .collect()
+    };
+    if bytes.len() < 5 || bytes[0] != HEADER || bytes[1] != HEADER {
+        return None;
     }
-
-    // LEN byte: covers CMD + DATA + FOOTER
-    let mut len_buf = [0u8; 1];
-    stream.read_exact(&mut len_buf)?;
-    let len = len_buf[0] as usize;
-    if len < 2 {
-        return Ok(Some((0, Vec::new()))); // malformed; caller can ignore
+    let len = bytes[2] as usize; // CMD + DATA + FOOTER
+    if len < 2 || bytes.len() < 3 + len {
+        return None;
     }
-
-    let mut rest = vec![0u8; len]; // CMD + DATA + FOOTER
-    stream.read_exact(&mut rest)?;
-
-    let command = rest[0];
-    let footer = rest[len - 1];
-    let data = rest[1..len - 1].to_vec();
-
-    if footer != FOOTER {
+    if bytes[3 + len - 1] != FOOTER {
         eprintln!(
             "warning: frame for cmd {:#04x} missing FA footer (got {:#04x}), using it anyway",
-            command, footer
+            bytes[3],
+            bytes[3 + len - 1]
         );
     }
-
-    Ok(Some((command, data)))
+    let command = bytes[3];
+    let data = bytes[4..3 + len - 1].to_vec();
+    Some((command, data))
 }
 
 fn handle_client(mut stream: TcpStream, state: Arc<Mutex<RobotState>>) {
@@ -176,19 +170,40 @@ fn handle_client(mut stream: TcpStream, state: Arc<Mutex<RobotState>>) {
         .unwrap_or_else(|_| "unknown".into());
     println!("client connected: {peer}");
 
+    let mut buf = [0u8; 1024];
+
+    // Handshake: serial port, baud, timeout -> reply "1" to each.
+    for step in ["serial port", "baud", "timeout"] {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => {
+                println!("client {peer} dropped during handshake");
+                return;
+            }
+            Ok(n) => {
+                println!("handshake {step}: {:?}", String::from_utf8_lossy(&buf[..n]));
+                if stream.write_all(b"1").is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
     loop {
-        let frame = match read_frame(&mut stream) {
-            Ok(Some(f)) => f,
-            Ok(None) => {
+        let n = match stream.read(&mut buf) {
+            Ok(0) => {
                 println!("client disconnected: {peer}");
                 return;
             }
+            Ok(n) => n,
             Err(e) => {
                 eprintln!("read error from {peer}: {e}");
                 return;
             }
         };
-        let (command, data) = frame;
+        let Some((command, data)) = parse_message(&buf[..n]) else {
+            eprintln!("unparseable message from {peer}: {:?}", &buf[..n]);
+            continue;
+        };
 
         let reply_data: Vec<u8> = {
             let mut st = state.lock().unwrap();
@@ -217,7 +232,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<Mutex<RobotState>>) {
                         let joint = data[0] as usize;
                         let raw = i16::from_be_bytes([data[1], data[2]]);
                         let speed = data[3];
-                        if joint >= 1 && joint <= 6 {
+                        if (1..=6).contains(&joint) {
                             st.angles_deg[joint - 1] = i16_to_angle(raw);
                         }
                         st.speed = speed;
